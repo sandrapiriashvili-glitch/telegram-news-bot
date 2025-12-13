@@ -163,7 +163,10 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     # Настройка автообновления новостей каждые 30 минут
-    job_queue = application.job_queue
+   if application.job_queue:
+    application.job_queue.run_repeating(auto_update_news, interval=1800, first=1800)
+else:
+    logger.warning("JobQueue не настроен. Автообновление отключено.")
     job_queue.run_repeating(auto_update_news, interval=1800, first=1800)  # 1800 сек = 30 мин
     
     # Запуск бота
