@@ -15,7 +15,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Telegram токен
-TOKEN = os.getenv('TELEGRAM_TOKEN')
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 
 # RSS источники новостей
 RSS_FEEDS = [
