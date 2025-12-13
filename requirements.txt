@@ -1,2 +1,6 @@
-   python-telegram-bot[job-queue]==21.9
-     feedparser==6.0.11
+python-telegram-bot[job-queue]==21.9
+requests
+feedparser
+beautifulsoup4
+lxml
+python-dotenv
