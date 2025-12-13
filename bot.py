@@ -164,7 +164,7 @@ def main():
     
     # Настройка автообновления новостей каждые 30 минут
    if application.job_queue:
-    application.job_queue.run_repeating(auto_update_news, interval=1800, first=1800)
+    application.job_queue.run_repeating(auto_update_news, interval=1800, first=10)
 else:
     logger.warning("JobQueue не настроен. Автообновление отключено.")
     job_queue.run_repeating(auto_update_news, interval=1800, first=1800)  # 1800 сек = 30 мин
