@@ -1,11 +1,17 @@
 import os
 import logging
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import time
+from datetime import datetime
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 import feedparser
-from datetime import datetime, timedelta
+import requests
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 import sqlite3
-import asyncio
+
+# Загрузка переменных окружения
+load_dotenv()
 
 # Настройка логирования
 logging.basicConfig(
@@ -14,163 +20,159 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Telegram токен
-TOKEN = os.getenv('TOKEN')
+# Получение токена
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+if not TOKEN:
+    raise ValueError("TELEGRAM_BOT_TOKEN не найден в переменных окружения!")
 
-# RSS источники новостей
-RSS_FEEDS = [
-    'https://lenta.ru/rss',
-    'https://www.vedomosti.ru/rss/news',
-    'https://tass.ru/rss/v2.xml',
-    'https://ria.ru/export/rss2/archive/index.xml',
-]
+# RSS-ленты
+RSS_FEEDS = {
+    'lenta': 'https://lenta.ru/rss',
+    'ria': 'https://ria.ru/export/rss2/archive/index.xml',
+    'tass': 'https://tass.ru/rss/v2.xml',
+    'interfax': 'https://www.interfax.ru/rss.asp'
+}
 
-# Инициализация базы данных
+# База данных для хранения подписчиков
 def init_db():
-    conn = sqlite3.connect('news.db')
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS news (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            link TEXT UNIQUE NOT NULL,
-            published TEXT,
-            source TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    conn = sqlite3.connect('subscribers.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS subscribers (
+            chat_id INTEGER PRIMARY KEY,
+            subscribed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     conn.commit()
     conn.close()
-    logger.info("База данных инициализирована")
 
-# Парсинг новостей из RSS
-def fetch_news():
-    conn = sqlite3.connect('news.db')
-    c = conn.cursor()
-    new_count = 0
-    
-    for feed_url in RSS_FEEDS:
-        try:
-            logger.info(f"Парсинг: {feed_url}")
-            feed = feedparser.parse(feed_url)
-            
-            for entry in feed.entries[:10]:  # Берём последние 10 новостей
-                title = entry.get('title', 'Без заголовка')
-                link = entry.get('link', '')
-                published = entry.get('published', '')
-                source = feed.feed.get('title', 'Неизвестный источник')
-                
-                try:
-                    c.execute('''
-                        INSERT INTO news (title, link, published, source)
-                        VALUES (?, ?, ?, ?)
-                    ''', (title, link, published, source))
-                    new_count += 1
-                except sqlite3.IntegrityError:
-                    pass  # Новость уже существует
-        except Exception as e:
-            logger.error(f"Ошибка при парсинге {feed_url}: {e}")
-    
+def add_subscriber(chat_id):
+    conn = sqlite3.connect('subscribers.db')
+    cursor = conn.cursor()
+    cursor.execute('INSERT OR IGNORE INTO subscribers (chat_id) VALUES (?)', (chat_id,))
     conn.commit()
     conn.close()
-    logger.info(f"Добавлено новостей: {new_count}")
-    return new_count
 
-# Получение последних новостей
-def get_latest_news(limit=5):
-    conn = sqlite3.connect('news.db')
-    c = conn.cursor()
-    c.execute('''
-        SELECT title, link, source, created_at 
-        FROM news 
-        ORDER BY created_at DESC 
-        LIMIT ?
-    ''', (limit,))
-    news = c.fetchall()
+def remove_subscriber(chat_id):
+    conn = sqlite3.connect('subscribers.db')
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM subscribers WHERE chat_id = ?', (chat_id,))
+    conn.commit()
     conn.close()
-    return news
 
-# Команда /start
+def get_all_subscribers():
+    conn = sqlite3.connect('subscribers.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT chat_id FROM subscribers')
+    subscribers = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return subscribers
+
+# Функция для парсинга новостей
+def fetch_news(limit=5):
+    news = []
+    for source, url in RSS_FEEDS.items():
+        try:
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:limit]:
+                news.append({
+                    'title': entry.title,
+                    'link': entry.link,
+                    'source': source.upper(),
+                    'published': entry.get('published', 'N/A')
+                })
+        except Exception as e:
+            logger.error(f"Ошибка парсинга {source}: {e}")
+    return news[:limit]
+
+# Команды бота
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [KeyboardButton("📰 Показать новости")],
-        [KeyboardButton("ℹ️ О боте"), KeyboardButton("🔄 Обновить новости")]
-    ]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    
     await update.message.reply_text(
-        "👋 Привет! Я бот для сбора новостей.\n\n"
-        "Нажми *📰 Показать новости*, чтобы увидеть последние новости.",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
+        "🤖 Привет! Я новостной бот.\n\n"
+        "Команды:\n"
+        "/news - Получить последние новости\n"
+        "/subscribe - Подписаться на автообновления\n"
+        "/unsubscribe - Отписаться от обновлений"
     )
 
-# Обработчик текстовых сообщений
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
+async def get_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔍 Ищу новости...")
+    news = fetch_news(5)
     
-    if text == "📰 Показать новости":
-        news = get_latest_news(5)
-        if news:
-            response = "📰 *Последние новости:*\n\n"
-            for i, (title, link, source, created_at) in enumerate(news, 1):
-                response += f"{i}. *{title}*\n"
-                response += f"   🔗 [Читать]({link})\n"
-                response += f"   📌 Источник: {source}\n\n"
-            await update.message.reply_text(response, parse_mode='Markdown', disable_web_page_preview=True)
-        else:
-            await update.message.reply_text("❌ Новостей пока нет. Попробуй обновить!")
+    if not news:
+        await update.message.reply_text("❌ Не удалось получить новости.")
+        return
     
-    elif text == "🔄 Обновить новости":
-        await update.message.reply_text("⏳ Обновляю новости...")
-        count = fetch_news()
-        await update.message.reply_text(f"✅ Добавлено новых новостей: {count}")
+    message = "📰 *Последние новости:*\n\n"
+    for item in news:
+        message += f"🔹 *{item['source']}*: {item['title']}\n🔗 {item['link']}\n\n"
     
-    elif text == "ℹ️ О боте":
-        await update.message.reply_text(
-            "ℹ️ *О боте*\n\n"
-            "Я собираю новости из популярных источников:\n"
-            "• Лента.ру\n"
-            "• Ведомости\n"
-            "• ТАСС\n"
-            "• РИА Новости\n\n"
-            "Новости обновляются каждые 30 минут автоматически.",
-            parse_mode='Markdown'
-        )
-    
-    else:
-        await update.message.reply_text("❓ Используй кнопки меню для взаимодействия с ботом.")
+    await update.message.reply_text(message, parse_mode='Markdown', disable_web_page_preview=True)
 
-# Фоновое обновление новостей
+async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    add_subscriber(chat_id)
+    await update.message.reply_text("✅ Вы подписались на автообновления новостей!")
+
+async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    remove_subscriber(chat_id)
+    await update.message.reply_text("❌ Вы отписались от автообновлений.")
+
+# Автообновление новостей для подписчиков
 async def auto_update_news(context: ContextTypes.DEFAULT_TYPE):
-    logger.info("Автоматическое обновление новостей...")
-    fetch_news()
-
-# Основная функция
-def main():
-    # Инициализация БД
-    init_db()
+    logger.info("Запуск автообновления новостей...")
+    subscribers = get_all_subscribers()
     
-    # Первая загрузка новостей
-    logger.info("Загрузка начальных новостей...")
-    fetch_news()
+    if not subscribers:
+        logger.info("Нет подписчиков для отправки новостей")
+        return
+    
+    news = fetch_news(3)
+    
+    if not news:
+        logger.warning("Не удалось получить новости для автообновления")
+        return
+    
+    message = "📰 *Автообновление новостей:*\n\n"
+    for item in news:
+        message += f"🔹 *{item['source']}*: {item['title']}\n🔗 {item['link']}\n\n"
+    
+    for chat_id in subscribers:
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=message,
+                parse_mode='Markdown',
+                disable_web_page_preview=True
+            )
+            logger.info(f"Новости отправлены подписчику {chat_id}")
+        except Exception as e:
+            logger.error(f"Ошибка отправки новостей подписчику {chat_id}: {e}")
+
+# Главная функция
+def main():
+    logger.info("Запуск бота...")
+    init_db()
     
     # Создание приложения
     application = Application.builder().token(TOKEN).build()
     
-    # Регистрация обработчиков
+    # Регистрация команд
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CommandHandler("news", get_news))
+    application.add_handler(CommandHandler("subscribe", subscribe))
+    application.add_handler(CommandHandler("unsubscribe", unsubscribe))
     
     # Настройка автообновления новостей каждые 30 минут
-   if application.job_queue:
-    application.job_queue.run_repeating(auto_update_news, interval=1800, first=10)
-else:
-    logger.warning("JobQueue не настроен. Автообновление отключено.")
-    job_queue.run_repeating(auto_update_news, interval=1800, first=1800)  # 1800 сек = 30 мин
+    if application.job_queue:
+        application.job_queue.run_repeating(auto_update_news, interval=1800, first=10)
+        logger.info("Автообновление новостей настроено (каждые 30 минут)")
+    else:
+        logger.warning("JobQueue недоступен. Автообновление отключено.")
     
     # Запуск бота
-    logger.info("Бот запущен!")
+    logger.info("Бот успешно запущен!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
